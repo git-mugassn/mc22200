@@ -1,0 +1,671 @@
+name: Permanent Quick Node
+
+on:
+  workflow_dispatch:              # 支持手动触发
+  repository_dispatch:            # 支持通过 API 触发
+    types: [restart-permanent-quick]
+
+permissions:
+  contents: write
+  actions: write  # 允许触发其他 workflow
+
+# 并发控制：新运行会取消旧运行，实现无缝切换
+concurrency:
+  group: permanent-quick-node
+  cancel-in-progress: true
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install OpenSSH, set Java 25, bore, Quick-Opening
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_TTL_MINUTES: "330"
+          NODE_WEB_PORTS: "1130 25565"
+        run: |
+          set -euo pipefail
+
+          TTL_MIN=${NODE_TTL_MINUTES:-60}
+          TTL_SEC=$(( TTL_MIN * 60 ))
+          PORT_LIST_STR="${NODE_WEB_PORTS:-1130 25565}"
+
+          echo ">>> TTL (minutes): $TTL_MIN"
+          echo ">>> Extra TCP ports to expose via bore: ${PORT_LIST_STR:-<none>}"
+
+          echo ">>> Install OpenSSH, curl, openssl, parted, rsync, python3"
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y openssh-server curl openssl parted e2fsprogs rsync python3
+          elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y openssh-server curl openssl parted e2fsprogs rsync python3
+          else
+            echo "Unsupported package manager"
+            exit 1
+          fi
+
+          # ===== Swap setup =====
+          echo ">>> Disable existing swap and remove old swap files"
+          EXISTING_SWAPS="$(swapon --show=NAME,TYPE --noheadings 2>/dev/null || true)"
+          if [ -n "$EXISTING_SWAPS" ]; then
+            sudo swapoff -a || true
+            while read -r DEV TYPE; do
+              [ -z "${DEV:-}" ] && continue
+              if [ "$TYPE" = "file" ] && [ -f "$DEV" ]; then
+                sudo rm -f "$DEV" || true
+              fi
+            done <<< "$EXISTING_SWAPS"
+          fi
+
+          echo ">>> Configure temporary swap on root filesystem"
+          ROOT_MOUNT="/"
+          FREE_KB=$(df --output=avail -k "$ROOT_MOUNT" | tail -n 1 | tr -d ' ')
+          FREE_MB=$(( FREE_KB / 1024 ))
+
+          if [ "$FREE_MB" -gt 1024 ]; then
+            SWAP_MB=$(( FREE_MB - 1024 ))
+            SWAP_GB=$(( SWAP_MB / 1024 ))
+            if [ "$SWAP_GB" -ge 1 ]; then
+              SWAPFILE="/swapfile_quick"
+              if ! sudo fallocate -l "${SWAP_GB}G" "$SWAPFILE" 2>/dev/null; then
+                sudo dd if=/dev/zero of="$SWAPFILE" bs=1M count="$SWAP_MB" status=progress
+              fi
+              sudo chmod 600 "$SWAPFILE"
+              sudo mkswap "$SWAPFILE"
+              sudo swapon "$SWAPFILE"
+              sudo sysctl -w vm.swappiness=80 || true
+            fi
+          fi
+
+          echo ">>> Set default Java to temurin-25 (如果存在)"
+          if command -v update-alternatives >/dev/null 2>&1; then
+            if update-alternatives --list java 2>/dev/null | grep -q 'temurin-25-jdk-amd64/bin/java'; then
+              if sudo update-alternatives --set java /usr/lib/jvm/temurin-25-jdk-amd64/bin/java; then
+                echo ">>> Switched default java to /usr/lib/jvm/temurin-25-jdk-amd64/bin/java"
+              else
+                echo "!!! Failed to set java to temurin-25, keep current default"
+              fi
+            else
+              echo "!!! temurin-25-jdk-amd64 not found in update-alternatives, keep existing default java"
+            fi
+          else
+            echo "update-alternatives command not found, skip setting default java"
+          fi
+
+          echo ">>> Java version (after switch, if成功):"
+          java -version || true
+
+          # ===== 不再挂载 WebDAV，直接创建本地 data 目录 =====
+          echo ">>> Creating local /data directory (no WebDAV mount)"
+          sudo mkdir -p /data
+          sudo chown root:root /data
+
+          # ===== 准备数据盘 =====
+          echo ">>> Prepare data disk (mountpoint: /mnt)"
+          if mountpoint -q /mnt; then
+            echo ">>> /mnt is already a mountpoint"
+          else
+            ROOT_DEV="$(findmnt -no SOURCE /)"
+            ROOT_DISK="$(lsblk -no PKNAME "$ROOT_DEV" 2>/dev/null || basename "$ROOT_DEV" | sed 's/[0-9]*$//')"
+            
+            DATA_DISK=""
+            while read -r disk type; do
+              disk_base="$(basename "$disk")"
+              if [ "$type" = "disk" ] && [ "$disk_base" != "$ROOT_DISK" ]; then
+                DATA_DISK="$disk"
+                break
+              fi
+            done < <(lsblk -dpno NAME,TYPE)
+
+            if [ -z "$DATA_DISK" ]; then
+              sudo mkdir -p /mnt
+            else
+              PARTS="$(lsblk -nrpo NAME "$DATA_DISK" | tail -n +2 || true)"
+              if [ -z "$PARTS" ]; then
+                sudo parted -s "$DATA_DISK" mklabel gpt
+                sudo parted -s "$DATA_DISK" mkpart primary ext4 0% 100%
+                sleep 2
+                PARTS="$(lsblk -nrpo NAME "$DATA_DISK" | tail -n +2 || true)"
+              fi
+              DATA_PART="$(echo "$PARTS" | head -n 1)"
+              FSTYPE="$(lsblk -no FSTYPE "$DATA_PART" | tr -d ' ')"
+              if [ -z "$FSTYPE" ]; then
+                sudo mkfs.ext4 -F "$DATA_PART"
+              fi
+              sudo mkdir -p /mnt
+              sudo mount "$DATA_PART" /mnt
+            fi
+          fi
+
+          # ===== 同步仓库到临时目录（避免与 /mnt 数据混淆）=====
+          ORIG_WD="${GITHUB_WORKSPACE:-$(pwd)}"
+          DATA_WORK_ROOT="/tmp/node-workspace"
+          DATA_REPO="${DATA_WORK_ROOT}/repo"
+          sudo mkdir -p "$DATA_WORK_ROOT"
+          sudo chown "$USER":"$USER" "$DATA_WORK_ROOT" || true
+          rsync -a "${ORIG_WD}/" "$DATA_REPO/"
+          
+          # 确保整个仓库目录有正确的权限
+          sudo chown -R "$USER":"$USER" "$DATA_REPO" || true
+          
+          cd "$DATA_REPO"
+
+          # ===== 准备 /mnt 目录 =====
+          QUICK_DIR="/mnt"
+          sudo mkdir -p "$QUICK_DIR"
+          
+          # 先设置基本权限
+          sudo chown "$USER":"$USER" "$QUICK_DIR"
+
+          # 创建或更新 reboot.txt（只在文件不存在时创建模板）
+          REBOOT_FILE="reboot.txt"
+          if [ ! -f "$DATA_REPO/$REBOOT_FILE" ]; then
+            echo ">>> Creating reboot.txt template (first run or file doesn't exist)..."
+            # 确保有写入权限
+            sudo chown "$USER":"$USER" "$DATA_REPO" || true
+            
+            echo "# 开机时可以在这里添加自定义启动命令" > "$DATA_REPO/$REBOOT_FILE"
+            echo "# 例如：从备份恢复数据等" >> "$DATA_REPO/$REBOOT_FILE"
+            echo "" >> "$DATA_REPO/$REBOOT_FILE"
+            echo ">>> reboot.txt template created"
+          else
+            echo ">>> reboot.txt already exists, keeping existing content"
+          fi
+          
+          # 创建或更新 shut.txt（只在文件不存在时创建模板）
+          SHUTDOWN_FILE="shut.txt"
+          if [ ! -f "$DATA_REPO/$SHUTDOWN_FILE" ]; then
+            echo ">>> Creating shut.txt template (first run or file doesn't exist)..."
+            echo "# 关机前可以在这里添加自定义关机命令" > "$DATA_REPO/$SHUTDOWN_FILE"
+            echo "# 例如：清理临时文件、保存配置等" >> "$DATA_REPO/$SHUTDOWN_FILE"
+            echo "" >> "$DATA_REPO/$SHUTDOWN_FILE"
+            echo ">>> shut.txt template created"
+          else
+            echo ">>> shut.txt already exists, keeping existing content"
+          fi
+
+          # 执行用户自定义的重启命令（如果文件存在且不为空）
+          if [ -f "$DATA_REPO/$REBOOT_FILE" ] && [ -s "$DATA_REPO/$REBOOT_FILE" ]; then
+            echo ">>> Found reboot.txt with content, executing custom commands..."
+            sudo bash -c "cd /root && while IFS= read -r cmd || [ -n \"\$cmd\" ]; do
+              if [ -z \"\$cmd\" ] || [[ \"\$cmd\" =~ ^[[:space:]]*# ]]; then
+                continue
+              fi
+              echo \">>> Executing: \$cmd\"
+              eval \"\$cmd\" || echo \"!!! Command failed: \$cmd\"
+            done < \"$DATA_REPO/$REBOOT_FILE\""
+          else
+            echo ">>> No reboot.txt found or file is empty, skipping custom startup commands"
+          fi
+          
+          # 自动下载并恢复最新备份（如果backup.txt存在）
+          if [ -f "$DATA_REPO/backup.txt" ] && [ -s "$DATA_REPO/backup.txt" ]; then
+            echo ">>> Found backup.txt, downloading latest backup..."
+            
+            # 获取最后一行备份信息
+            LAST_LINE=$(tail -n 1 "$DATA_REPO/backup.txt")
+            LAST_FILENAME=$(echo "$LAST_LINE" | awk '{print $1}')
+            
+            # 检查是否是分片备份（文件名包含.part数字.tar.gz）
+            if [[ "$LAST_FILENAME" =~ \.part[0-9]+\.tar\.gz$ ]]; then
+              # 这是分片备份，提取基础文件名和时间戳
+              BASE_NAME=$(echo "$LAST_FILENAME" | sed 's/\.part[0-9]*\.tar\.gz$//')
+              echo ">>> Found split backup: $BASE_NAME"
+              
+              # 从backup.txt中找到所有相同基础名的分片
+              cd /mnt
+              DOWNLOAD_SUCCESS=true
+              
+              # 创建临时文件存储分片信息
+              TEMP_PARTS="/tmp/backup_parts.txt"
+              > "$TEMP_PARTS"
+              
+              # 倒序读取backup.txt，找到所有相同基础名的分片
+              tac "$DATA_REPO/backup.txt" | while read -r line; do
+                if [ -z "$line" ] || [[ "$line" =~ ^# ]]; then
+                  continue
+                fi
+                
+                FILENAME=$(echo "$line" | awk '{print $1}')
+                FILE_URL=$(echo "$line" | awk '{print $2}')
+                
+                # 检查是否属于同一个备份的分片
+                if [[ "$FILENAME" =~ ^${BASE_NAME}\.part[0-9]+\.tar\.gz$ ]]; then
+                  echo "$FILENAME $FILE_URL" >> "$TEMP_PARTS"
+                else
+                  # 遇到不同备份的文件，停止
+                  break
+                fi
+              done
+              
+              # 读取分片信息并下载
+              PART_COUNT=0
+              if [ -s "$TEMP_PARTS" ]; then
+                while read -r FILENAME FILE_URL; do
+                  PART_NUM=$(echo "$FILENAME" | grep -o 'part[0-9]*' | sed 's/part//')
+                  echo ">>> Downloading part $PART_NUM: $FILENAME"
+                  
+                  if curl -L -o "$FILENAME" "$FILE_URL"; then
+                    echo ">>> Part $PART_NUM downloaded successfully"
+                    PART_COUNT=$((PART_COUNT + 1))
+                  else
+                    echo "!!! Failed to download part $PART_NUM"
+                    DOWNLOAD_SUCCESS=false
+                    break
+                  fi
+                done < "$TEMP_PARTS"
+              fi
+              
+              rm -f "$TEMP_PARTS"
+              
+              if [ "$DOWNLOAD_SUCCESS" = true ] && [ "$PART_COUNT" -gt 0 ]; then
+                echo ">>> All $PART_COUNT parts downloaded, reassembling..."
+                BACKUP_FILE="${BASE_NAME}.tar.gz"
+                
+                # 重新组装文件（按part1, part2, part3...顺序）
+                > "$BACKUP_FILE"  # 创建空文件
+                for i in $(seq 1 "$PART_COUNT"); do
+                  PART_FILE="${BASE_NAME}.part${i}.tar.gz"
+                  if [ -f "$PART_FILE" ]; then
+                    cat "$PART_FILE" >> "$BACKUP_FILE"
+                    rm -f "$PART_FILE"
+                  else
+                    echo "!!! Part file $PART_FILE not found"
+                    DOWNLOAD_SUCCESS=false
+                    break
+                  fi
+                done
+                
+                if [ "$DOWNLOAD_SUCCESS" = true ]; then
+                  # 如果mc目录存在，先备份
+                  if [ -d mc ]; then
+                    echo ">>> Existing mc directory found, creating backup..."
+                    mv mc "mc_backup_$(date +'%Y%m%d_%H%M%S')" || true
+                  fi
+                  
+                  # 解压备份文件
+                  if tar -xzf "$BACKUP_FILE"; then
+                    echo ">>> Split backup restored successfully to /mnt/mc"
+                    sudo chown -R "$USER":"$USER" mc/ || true
+                  else
+                    echo "!!! Failed to extract reassembled backup file"
+                  fi
+                  
+                  rm -f "$BACKUP_FILE"
+                else
+                  echo "!!! Failed to reassemble split backup"
+                fi
+              else
+                echo "!!! Failed to download all parts of split backup"
+              fi
+              
+            else
+              # 这是单文件备份
+              BACKUP_FILENAME=$(echo "$LAST_LINE" | awk '{print $1}')
+              BACKUP_URL=$(echo "$LAST_LINE" | awk '{print $2}')
+              
+              if [ -n "$BACKUP_URL" ] && [ -n "$BACKUP_FILENAME" ]; then
+                echo ">>> Downloading single backup: $BACKUP_FILENAME from $BACKUP_URL"
+                cd /mnt
+                
+                # 下载备份文件
+                if curl -L -o "$BACKUP_FILENAME" "$BACKUP_URL"; then
+                  echo ">>> Download successful, extracting to mc directory..."
+                  
+                  # 如果mc目录存在，先备份
+                  if [ -d mc ]; then
+                    echo ">>> Existing mc directory found, creating backup..."
+                    mv mc "mc_backup_$(date +'%Y%m%d_%H%M%S')" || true
+                  fi
+                  
+                  # 解压备份文件
+                  if tar -xzf "$BACKUP_FILENAME"; then
+                    echo ">>> Backup restored successfully to /mnt/mc"
+                    # 设置正确的权限
+                    sudo chown -R "$USER":"$USER" mc/ || true
+                  else
+                    echo "!!! Failed to extract backup file"
+                  fi
+                  
+                  # 清理下载的备份文件
+                  rm -f "$BACKUP_FILENAME"
+                else
+                  echo "!!! Failed to download backup from $BACKUP_URL"
+                fi
+              else
+                echo "!!! Invalid backup entry format in backup.txt"
+              fi
+            fi
+            
+            # 切换回仓库目录
+            cd "$DATA_REPO"
+          else
+            echo ">>> No backup.txt found or file is empty, skipping backup restore (first run?)"
+          fi
+          
+          # 恢复数据后，重新设置整个 /mnt 目录权限
+          echo ">>> Setting permissions on /mnt after restore..."
+          sudo chown -R "$USER":"$USER" "$QUICK_DIR"
+          echo ">>> Permissions set"
+          
+          # ===== 下载并运行 Quick-Opening =====
+          QUICK_PY="${QUICK_DIR}/Mugassn-Quick-Opening.py"
+          QUICK_LOG="${QUICK_DIR}/Mugassn-Quick-Opening.log"
+          cd "$QUICK_DIR"
+          
+          echo ">>> Download and run Mugassn-Quick-Opening.py under /mnt"
+          echo ">>> Downloading script to $QUICK_PY"
+          curl -L "https://github.com/Mugassn-Victor/file/releases/download/file/Mugassn-Quick-Opening.py" -o "$QUICK_PY"
+          
+          echo ">>> Start Mugassn-Quick-Opening.py in background"
+          nohup python3 "$QUICK_PY" > "$QUICK_LOG" 2>&1 &
+
+          cd "$DATA_REPO"
+
+          # ===== 下载 bore =====
+          echo ">>> Detect arch & download bore"
+          ARCH="$(uname -m)"
+          if [ "$ARCH" = "x86_64" ]; then
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-unknown-linux-musl.tar.gz"
+          else
+            BORE_URL="https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-aarch64-unknown-linux-musl.tar.gz"
+          fi
+          
+          # 确保当前目录有写入权限
+          sudo chown "$USER":"$USER" "$DATA_REPO" || true
+          
+          curl -L "$BORE_URL" -o bore.tar.gz
+          tar -xzf bore.tar.gz
+          if [ ! -f bore ]; then
+            BORE_BIN="$(find . -maxdepth 3 -type f -name 'bore' | head -n 1)"
+            mv "$BORE_BIN" bore
+          fi
+          chmod +x bore
+
+          # ===== SSH 配置 =====
+          sudo mkdir -p /var/run/sshd
+
+          SAVED_PASSWORD=""
+          if [ -f ssh.txt ]; then
+            SAVED_PASSWORD=$(grep -oP '(?<=password: ).+' ssh.txt 2>/dev/null || true)
+            if [ -n "$SAVED_PASSWORD" ]; then
+              ROOT_PASS="$SAVED_PASSWORD"
+            fi
+          fi
+          if [ -z "${ROOT_PASS:-}" ]; then
+            ROOT_PASS="$(openssl rand -base64 18 | tr -d '=+/' | head -c 16)"
+          fi
+          echo "root:${ROOT_PASS}" | sudo chpasswd
+
+          if [ -d key ]; then
+            sudo cp -f key/* /etc/ssh/
+            sudo chmod 600 /etc/ssh/ssh_host_*_key
+            sudo chmod 644 /etc/ssh/ssh_host_*_key.pub
+          fi
+
+          sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+          sudo sed -i 's/^#\?KbdInteractiveAuthentication .*/KbdInteractiveAuthentication no/' /etc/ssh/sshd_config || true
+
+          sudo /usr/sbin/sshd -D -e &
+          SSHD_PID=$!
+          sleep 2
+          
+          if [ ! -d key ]; then
+            mkdir -p key
+            sudo cp /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub key/
+            sudo chmod 644 key/*
+          fi
+
+          rm -f bore_*.log bore_ssh.log
+
+          SAVED_SSH_PORT=""
+          if [ -f ssh.txt ]; then
+            SAVED_SSH_PORT=$(grep -oP '(?<=-p )\d+' ssh.txt 2>/dev/null || true)
+          fi
+          
+          if [ -n "$SAVED_SSH_PORT" ]; then
+            nohup ./bore local 22 --to bore.pub --port "$SAVED_SSH_PORT" > bore_ssh.log 2>&1 &
+          else
+            nohup ./bore local 22 --to bore.pub > bore_ssh.log 2>&1 &
+          fi
+
+          read -ra PORTS <<< "$PORT_LIST_STR"
+          if [ "${#PORTS[@]}" -gt 0 ]; then
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then continue; fi
+              
+              # 尝试从 web.txt 读取之前保存的端口
+              SAVED_WEB_PORT=""
+              if [ -f web.txt ]; then
+                SAVED_WEB_PORT=$(grep "^${p_trim} " web.txt 2>/dev/null | grep -oP ':\K\d+' | head -n 1 || true)
+              fi
+              
+              if [ -n "$SAVED_WEB_PORT" ]; then
+                nohup ./bore local "$p_trim" --to bore.pub --port "$SAVED_WEB_PORT" > "bore_${p_trim}.log" 2>&1 &
+              else
+                nohup ./bore local "$p_trim" --to bore.pub > "bore_${p_trim}.log" 2>&1 &
+              fi
+            done
+          fi
+
+          sleep 10
+          SSH_HOST="nat.mugassn.dpdns.org"
+
+          set +e
+          SSH_REMOTE_LINE="$(grep -Eo 'bore\.pub:[0-9]+' bore_ssh.log 2>/dev/null | head -n 1)"
+          set -e
+          echo ">>> SSH bore log result: $SSH_REMOTE_LINE"
+          if [ -n "$SSH_REMOTE_LINE" ]; then
+            SSH_REMOTE_PORT="${SSH_REMOTE_LINE##*:}"
+            SSH_CMD="ssh root@${SSH_HOST} -p ${SSH_REMOTE_PORT}"
+            echo ">>> Creating ssh.txt with: $SSH_CMD"
+            {
+              echo "${SSH_CMD}"
+              echo "password: ${ROOT_PASS}"
+            } > ssh.txt
+            echo ">>> ssh.txt created successfully"
+          else
+            echo "!!! Failed to get SSH port from bore log"
+          fi
+
+          echo ">>> Creating web.txt..."
+          > web.txt
+          if [ "${#PORTS[@]}" -gt 0 ]; then
+            for p in "${PORTS[@]}"; do
+              p_trim="$(echo "$p" | xargs || true)"
+              if [ -z "$p_trim" ]; then continue; fi
+              log_file="bore_${p_trim}.log"
+              echo ">>> Checking log file: $log_file"
+              if [ -f "$log_file" ]; then
+                set +e
+                REMOTE_LINE="$(grep -Eo 'bore\.pub:[0-9]+' "$log_file" 2>/dev/null | head -n 1)"
+                set -e
+                echo ">>> Port $p_trim bore result: $REMOTE_LINE"
+                if [ -n "$REMOTE_LINE" ]; then
+                  REMOTE_PORT="${REMOTE_LINE##*:}"
+                  PUBLIC="${SSH_HOST}:${REMOTE_PORT}"
+                  LABEL=""
+                  case "$p_trim" in
+                    1130) LABEL="快捷开服面板" ;;
+                    25565) LABEL="MC 游戏端口" ;;
+                    *) LABEL="游戏端口" ;;
+                  esac
+                  if [ -n "$LABEL" ]; then
+                    echo "${p_trim} ${PUBLIC} # ${LABEL}" >> web.txt
+                  else
+                    echo "${p_trim} ${PUBLIC}" >> web.txt
+                  fi
+                  echo ">>> Added port $p_trim to web.txt"
+                else
+                  echo "!!! No bore result for port $p_trim"
+                fi
+              else
+                echo "!!! Log file $log_file not found"
+              fi
+            done
+          fi
+          echo ">>> web.txt creation completed"
+
+          git config user.name "permanent-node-automation"
+          git config user.email "permanent-node-automation@noreply.local"
+          
+          # 调试：检查文件是否存在
+          echo ">>> Checking generated files before git add:"
+          ls -la ssh.txt web.txt key/ reboot.txt shut.txt 2>/dev/null || echo "Some files missing"
+          
+          # 分别添加存在的文件
+          [ -f ssh.txt ] && git add ssh.txt || echo "ssh.txt not found"
+          [ -f web.txt ] && git add web.txt || echo "web.txt not found"
+          [ -d key ] && git add key/ || echo "key/ directory not found"
+          [ -f reboot.txt ] && git add reboot.txt || echo "reboot.txt not found"
+          [ -f shut.txt ] && git add shut.txt || echo "shut.txt not found"
+          [ -f backup.txt ] && git add backup.txt || echo "backup.txt not found (normal for first run)"
+          
+          TS="$(date -u +%Y%m%dT%H%M%SZ)"
+          git commit -m "chore: update permanent quick node endpoints $TS" || true
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME} || true
+
+          echo ">>> Permanent Quick node ready!"
+          sleep "$TTL_SEC" || true
+          
+          echo ">>> TTL reached, executing shutdown commands..."
+          
+          # 执行关机前命令（如果存在）
+          SHUTDOWN_FILE="shut.txt"
+          if [ -f "$DATA_REPO/$SHUTDOWN_FILE" ]; then
+            echo ">>> Found shut.txt, executing shutdown commands..."
+            SHUTDOWN_PATH="$DATA_REPO/$SHUTDOWN_FILE"
+            
+            # 记录备份开始时间
+            BACKUP_START=$(date +%s)
+            echo ">>> Backup started at: $(date)"
+            
+            # 执行用户自定义的关机命令
+            sudo bash -c "cd /root && while IFS= read -r cmd || [ -n \"\$cmd\" ]; do
+              if [ -z \"\$cmd\" ] || [[ \"\$cmd\" =~ ^[[:space:]]*# ]]; then continue; fi
+              echo \">>> Executing: \$cmd\"
+              eval \"\$cmd\" || echo \"!!! Command failed: \$cmd\"
+            done < \"$SHUTDOWN_PATH\""
+            
+            # 计算备份用时
+            BACKUP_END=$(date +%s)
+            BACKUP_DURATION=$((BACKUP_END - BACKUP_START))
+            echo ">>> Custom shutdown commands completed in ${BACKUP_DURATION} seconds"
+            
+            # 直接在工作流中执行备份上传
+            echo ">>> Starting MC backup and upload..."
+            if [ -d /mnt/mc ]; then
+              cd /mnt
+              BACKUP_TIME=$(TZ='Asia/Shanghai' date +'%Y%m%d_%H%M%S')
+              BACKUP_FILE="mc_backup_${BACKUP_TIME}.tar.gz"
+              echo ">>> Creating backup: $BACKUP_FILE"
+              tar -czf "$BACKUP_FILE" mc/
+              
+              # 检查文件大小
+              BACKUP_SIZE=$(stat -c%s "$BACKUP_FILE" 2>/dev/null || echo "0")
+              BACKUP_SIZE_MB=$((BACKUP_SIZE / 1024 / 1024))
+              echo ">>> Backup size: ${BACKUP_SIZE_MB}MB"
+              
+              if [ "$BACKUP_SIZE_MB" -gt 1000 ]; then
+                echo ">>> Backup is larger than 1000MB, splitting into 1000MB chunks..."
+                # 分割文件为1000MB的块
+                split -b 1000M "$BACKUP_FILE" "${BACKUP_FILE}.part"
+                rm -f "$BACKUP_FILE"  # 删除原始大文件
+                
+                # 重命名分片文件为part1, part2格式
+                PART_NUM=1
+                for part_file in "${BACKUP_FILE}".part*; do
+                  if [ -f "$part_file" ]; then
+                    NEW_NAME="mc_backup_${BACKUP_TIME}.part${PART_NUM}.tar.gz"
+                    mv "$part_file" "$NEW_NAME"
+                    PART_NUM=$((PART_NUM + 1))
+                  fi
+                done
+                
+                # 上传所有分片
+                UPLOAD_SUCCESS=true
+                PART_COUNT=0
+                for part_file in mc_backup_${BACKUP_TIME}.part*.tar.gz; do
+                  if [ -f "$part_file" ]; then
+                    PART_COUNT=$((PART_COUNT + 1))
+                    echo ">>> Uploading part ${PART_COUNT}: $(basename "$part_file")"
+                    UPLOAD_RESULT=$(curl -s -F "files[]=@$part_file" https://pomf.lain.la/upload.php)
+                    echo ">>> Upload result: $UPLOAD_RESULT"
+                    DOWNLOAD_URL=$(echo "$UPLOAD_RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['files'][0]['url'] if 'files' in data and len(data['files']) > 0 else '')" 2>/dev/null || echo "")
+                    
+                    if [ -n "$DOWNLOAD_URL" ]; then
+                      echo ">>> Part ${PART_COUNT} upload successful: $DOWNLOAD_URL"
+                      echo "$(basename "$part_file") $DOWNLOAD_URL" >> "$DATA_REPO/backup.txt"
+                    else
+                      echo "!!! Part ${PART_COUNT} upload failed"
+                      UPLOAD_SUCCESS=false
+                    fi
+                    rm -f "$part_file"
+                  fi
+                done
+                
+                if [ "$UPLOAD_SUCCESS" = true ]; then
+                  echo ">>> All ${PART_COUNT} parts uploaded successfully"
+                else
+                  echo "!!! Some parts failed to upload"
+                fi
+              else
+                echo ">>> Backup size is acceptable, uploading as single file..."
+                echo ">>> Uploading to pomf..."
+                UPLOAD_RESULT=$(curl -s -F "files[]=@$BACKUP_FILE" https://pomf.lain.la/upload.php)
+                echo ">>> Upload result: $UPLOAD_RESULT"
+                DOWNLOAD_URL=$(echo "$UPLOAD_RESULT" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['files'][0]['url'] if 'files' in data and len(data['files']) > 0 else '')" 2>/dev/null || echo "")
+                if [ -n "$DOWNLOAD_URL" ]; then
+                  echo ">>> Upload successful: $DOWNLOAD_URL"
+                  echo "$BACKUP_FILE $DOWNLOAD_URL" >> "$DATA_REPO/backup.txt"
+                else
+                  echo "!!! Upload failed or could not parse response"
+                fi
+                rm -f "$BACKUP_FILE"
+              fi
+            else
+              echo ">>> No /mnt/mc directory found, skipping backup"
+            fi
+            
+            # 提交 backup.txt 到仓库
+            cd "$DATA_REPO"
+            if [ -f backup.txt ]; then
+              echo ">>> Committing backup.txt to repository..."
+              git add backup.txt || true
+              # 确保其他重要文件也被添加
+              git add ssh.txt web.txt key/ reboot.txt shut.txt || true
+              BACKUP_TS="$(date -u +%Y%m%dT%H%M%SZ)"
+              git commit -m "chore: update backup links and node info $BACKUP_TS" || true
+              REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+              git push "$REMOTE_URL" HEAD:${GITHUB_REF_NAME} || true
+              echo ">>> backup.txt and other files committed successfully"
+            fi
+            
+            # 等待备份完全完成
+            echo ">>> Waiting for backup sync to complete..."
+            sleep 30
+          else
+            echo ">>> No shut.txt found, skipping custom shutdown commands"
+          fi
+          
+          echo ">>> Triggering next run..."
+          curl -s -X POST \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/dispatches" \
+            -d '{"event_type":"restart-permanent-quick"}' || true
+          
+          # 给下一轮启动缓冲时间，避免重叠
+          echo ">>> Waiting for next run startup..."
+          sleep 180  # 3分钟缓冲时间
