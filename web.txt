@@ -1,2 +1,0 @@
-1130 nat.mugassn.dpdns.org:7835 # 快捷开服面板
-25565 nat.mugassn.dpdns.org:7835 # MC 游戏端口
