@@ -18,3 +18,4 @@ mc_backup_20260206_085307.tar.gz https://pomf2.lain.la/f/9wml30op.tar.gz
 mc_backup_20260206_142913.tar.gz https://pomf2.lain.la/f/7zp9792r.tar.gz
 mc_backup_20260206_200932.tar.gz https://pomf2.lain.la/f/583fe5vn.tar.gz
 mc_backup_20260207_014355.tar.gz https://pomf2.lain.la/f/h016sl8q.tar.gz
+mc_backup_20260207_071752.tar.gz https://pomf2.lain.la/f/ugf7ppw6.tar.gz
